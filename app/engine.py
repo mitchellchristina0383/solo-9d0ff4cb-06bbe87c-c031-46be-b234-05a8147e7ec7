@@ -29,6 +29,10 @@ class ValidationError(Exception):
     pass
 
 
+class AppendCancelled(Exception):
+    """在分配任何 KV 块之前收到取消请求，本次追加未开始。"""
+
+
 @dataclass
 class Branch:
     id: str
@@ -58,6 +62,20 @@ class Engine:
         self.lock = threading.RLock()  # 所有状态变更都在锁内完成，保证并发追加的原子性
         self.sessions: dict[str, Session] = {}
         self._branch_seq = itertools.count(1)
+        self._release_listeners: list = []
+
+    # 块被回收后通知等待容量的任务队列重试（回调在引擎锁内调用，
+    # 监听方不得反向获取引擎锁；任务队列的实现满足这一点）。
+    def add_release_listener(self, fn) -> None:
+        with self.lock:
+            self._release_listeners.append(fn)
+
+    def _notify_released(self) -> None:
+        for fn in list(self._release_listeners):
+            try:
+                fn()
+            except Exception:
+                pass
 
     # ---------- 构造 ----------
 
@@ -162,12 +180,16 @@ class Engine:
             for branch in list(session.branches.values()):
                 self._release_branch_blocks(branch)
             del self.sessions[session_id]
+            self._notify_released()
             return {"closed": session_id}
 
-    def _release_branch_blocks(self, branch: Branch) -> None:
+    def _release_branch_blocks(self, branch: Branch) -> bool:
+        if not branch.block_ids:
+            return False
         for b in branch.block_ids:
             self.pool.decref(b)
         branch.block_ids = []
+        return True
 
     # ---------- 分叉 ----------
 
@@ -195,29 +217,71 @@ class Engine:
 
     # ---------- 追加（原子，受总块数限制） ----------
 
-    def append(self, session_id: str, branch_id: str, tokens: list[int]) -> dict:
+    def validate_append(self, session_id: str, branch_id: str,
+                        tokens: list[int]) -> dict:
+        """只校验不执行：供任务队列在入队时快速拒绝非法请求。"""
         self._check_tokens(tokens)
         with self.lock:
             session = self._get_session(session_id)
             branch = self._get_branch(session, branch_id)
-            B = self.pool.block_size
-            L = branch.length
-            new_len = L + len(tokens)
-            if new_len > self.model.max_positions:
-                raise ValidationError(f"追加后长度 {new_len} 超出位置表上限 {self.model.max_positions}")
+            if branch.length + len(tokens) > self.model.max_positions:
+                raise ValidationError(
+                    f"追加后长度 {branch.length + len(tokens)} "
+                    f"超出位置表上限 {self.model.max_positions}")
+            return {"branch_name": branch.name, "length": branch.length}
 
-            cur_blocks = len(branch.block_ids)
-            need_blocks = _ceil_div(new_len, B)
-            # 末尾块未满且被共享 -> 追加前必须写时复制一块
-            cow = (L % B != 0 and cur_blocks > 0
-                   and self.pool.refcount[branch.block_ids[-1]] > 1)
-            extra = (need_blocks - cur_blocks) + (1 if cow else 0)
-            if self.pool.num_free < extra:
-                # 整体拒绝：分支内容与块占用保持原样
-                raise CapacityError(
-                    f"追加 {len(tokens)} 个词元需要 {extra} 个空闲块，"
-                    f"当前仅 {self.pool.num_free} 个，本次追加已整体拒绝")
+    def append(self, session_id: str, branch_id: str, tokens: list[int],
+               begin=None) -> dict:
+        """同步追加。
 
+        `begin` 在锁内、分配任何块之前调用一次；返回 True 表示已在拿块前
+        被取消，此时抛 AppendCancelled 且不改变任何状态。调用方应在这里
+        原子地完成“检查取消 / 标记已开始”，从而与取消请求互斥。
+        """
+        self._check_tokens(tokens)
+        with self.lock:
+            session = self._get_session(session_id)
+            branch = self._get_branch(session, branch_id)
+            self._append_locked(branch, tokens, begin)
+            return {"session_id": session_id,
+                    "branch": self._branch_dict(branch)}
+
+    def _append_locked(self, branch: Branch, tokens: list[int],
+                       begin=None) -> None:
+        """在锁内执行一次追加；任何异常都把分支与块池恢复到调用前的状态。
+
+        提交前已检查容量，因此正常路径不会失败；回滚用于防御写入阶段的
+        意外异常（例如模型/内存错误），保证“已开始的追加整体成功或整体回滚”。
+        """
+        B = self.pool.block_size
+        L = branch.length
+        new_len = L + len(tokens)
+        if new_len > self.model.max_positions:
+            raise ValidationError(f"追加后长度 {new_len} 超出位置表上限 {self.model.max_positions}")
+
+        cur_blocks = len(branch.block_ids)
+        need_blocks = _ceil_div(new_len, B)
+        # 末尾块未满且被共享 -> 追加前必须写时复制一块
+        cow = (L % B != 0 and cur_blocks > 0
+               and self.pool.refcount[branch.block_ids[-1]] > 1)
+        extra = (need_blocks - cur_blocks) + (1 if cow else 0)
+        if self.pool.num_free < extra:
+            # 整体拒绝：分支内容与块占用保持原样
+            raise CapacityError(
+                f"追加 {len(tokens)} 个词元需要 {extra} 个空闲块，"
+                f"当前仅 {self.pool.num_free} 个，本次追加已整体拒绝")
+
+        # 拿块之前的最后一道取消检查：与分配同处锁内，不存在
+        # “取消成功但其实已经拿到块”的窗口。
+        if begin is not None and begin():
+            raise AppendCancelled("任务在分配 KV 块前被取消")
+
+        # 事务快照：块池只有引用计数与空闲栈会变化，K/V 写入都落在新块上，
+        # 回滚后这些块重新空闲，旧内容不会被已提交的分支读到。
+        pool_state = self.pool.save_state()
+        saved_tokens = list(branch.tokens)
+        saved_blocks = list(branch.block_ids)
+        try:
             # 提交阶段：先写时复制，再补齐新块，最后写入 K/V
             if cow:
                 old = branch.block_ids[-1]
@@ -230,8 +294,11 @@ class Engine:
             for i, tok in enumerate(tokens):
                 self._write_token_kv(branch, tok, L + i)
                 branch.tokens.append(tok)
-            return {"session_id": session_id,
-                    "branch": self._branch_dict(branch)}
+        except BaseException:
+            branch.tokens[:] = saved_tokens
+            branch.block_ids[:] = saved_blocks
+            self.pool.restore_state(pool_state)
+            raise
 
     # ---------- 查询 ----------
 
@@ -269,6 +336,7 @@ class Engine:
             branch = self._get_branch(session, branch_id)
             del session.branches[branch_id]
             self._release_branch_blocks(branch)  # 只有引用归零的块才真正回到空闲池
+            self._notify_released()
             return {"closed": branch_id}
 
     # ---------- 统计 ----------

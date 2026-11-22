@@ -46,6 +46,18 @@
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .pill { display:inline-block; background:#eff1f3; border-radius:10px; padding:1px 8px;
           font-size:12px; margin-right:4px; }
+  .st { display:inline-block; border-radius:10px; padding:1px 8px; font-size:12px;
+        font-weight:600; white-space:nowrap; }
+  .st-queued { background:#fff8c5; color:#7d4e00; }
+  .st-running { background:#ddf4ff; color:#0969da; }
+  .st-succeeded { background:#dafbe1; color:#1a7f37; }
+  .st-cancelled { background:#f0f1f3; color:#57606a; }
+  .st-failed { background:#ffebe9; color:#cf222e; }
+  .st-wait { background:#ffe8c2; color:#9a6700; }
+  .q-live { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  .q-live .pill { background:#fff; border:1px solid var(--bd); }
+  .mini { font-size:12px; }
+  td.wrap { max-width:260px; overflow-wrap:anywhere; }
 </style>
 </head>
 <body>
@@ -71,13 +83,23 @@
     <h2>分支操作：<code id="sel-label"></code></h2>
     <div class="row">
       <input id="append-tokens" placeholder="追加词元，如：7 8 9">
-      <button id="btn-append">追加并预测</button>
+      <button id="btn-append">同步追加并预测</button>
+      <button id="btn-enqueue" class="ghost">加入队列</button>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      同步追加在容量不足时直接失败；加入队列会按会话公平排队，可在开始执行前取消。
     </div>
     <div class="row" style="margin-top:8px">
       <input id="fork-pos" type="number" min="0" placeholder="分叉点位置" style="width:140px">
       <button id="btn-fork" class="ghost">在此处分叉</button>
       <button id="btn-close" class="danger">关闭该分支</button>
     </div>
+  </section>
+
+  <section>
+    <h2>追加任务队列 <span class="muted" id="queue-summary"></span></h2>
+    <div class="q-live" id="queue-live"></div>
+    <div id="queue-jobs"><span class="muted">暂无追加任务</span></div>
   </section>
 
   <section>
@@ -123,12 +145,91 @@ async function api(path, opts={}) {
 
 async function refresh() {
   try {
-    const [stats, sessions] = await Promise.all([
-      api('/api/stats'), api('/api/sessions')
+    const [stats, sessions, jobs] = await Promise.all([
+      api('/api/stats'), api('/api/sessions'), api('/api/queue')
     ]);
     renderStats(stats);
     await renderSessions(sessions.sessions);
+    renderQueue(jobs);
   } catch (e) { toast(e.message); }
+}
+
+const STATUS_TEXT = {
+  queued: '排队中', running: '执行中', succeeded: '成功',
+  cancelled: '已取消', failed: '失败'
+};
+
+function statusBadge(j) {
+  let text = STATUS_TEXT[j.status] || j.status;
+  let cls = `st st-${j.status}`;
+  if (j.status === 'queued' && j.waiting_capacity) {
+    return `<span class="st st-wait" title="${esc(j.detail || '')}">排队中·等容量</span>`;
+  }
+  return `<span class="${cls}">${text}</span>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('zh-CN', {hour12: false});
+}
+
+function renderQueue(data) {
+  const jobs = data.jobs || [];
+  const counts = data.counts || {};
+  const running = data.running_sessions || [];
+  document.getElementById('queue-summary').textContent =
+    Object.keys(STATUS_TEXT).map(k => `${STATUS_TEXT[k]} ${counts[k] || 0}`).join(' · ') +
+    (running.length ? `　（执行中会话 ${running.join(', ')}）` : '');
+
+  const live = document.getElementById('queue-live');
+  live.innerHTML = '';
+  const active = jobs.filter(j => j.status === 'queued' || j.status === 'running');
+  if (active.length) {
+    for (const j of active.slice().reverse()) {
+      const el = document.createElement('span');
+      el.className = 'pill';
+      el.innerHTML = `${statusBadge(j)} <code>${esc(j.branch_name)}</code> ` +
+        `<span class="muted">会话 ${esc(j.session_id)} · ${j.tokens.length} 词元` +
+        (j.waiting_capacity ? ' · 等待块回收' : '') + `</span>`;
+      live.appendChild(el);
+    }
+  } else {
+    live.innerHTML = '<span class="muted">队列空闲</span>';
+  }
+
+  const box = document.getElementById('queue-jobs');
+  if (!jobs.length) {
+    box.innerHTML = '<span class="muted">暂无追加任务</span>';
+    return;
+  }
+  let html = `<table><tr><th>任务</th><th>状态</th><th>会话 / 分支</th>
+              <th>追加词元</th><th>提交</th><th>结束</th><th>说明</th><th></th></tr>`;
+  for (const j of jobs) {
+    const canCancel = j.status === 'queued' ||
+      (j.status === 'running' && !j.started);
+    const detail = j.status === 'succeeded' && j.result
+      ? `长度 ${j.result.length}，下一词元 <b>${j.result.prediction.argmax}</b>`
+      : (j.detail || '');
+    html += `<tr>
+      <td><code>${esc(j.id)}</code></td>
+      <td>${statusBadge(j)}</td>
+      <td class="mini">${esc(j.session_id)} / <code>${esc(j.branch_name)}</code></td>
+      <td class="wrap">${j.tokens.map(t => `<span class="pill">${t}</span>`).join('')}</td>
+      <td class="mini">${fmtTime(j.created_at)}</td>
+      <td class="mini">${fmtTime(j.finished_at)}</td>
+      <td class="mini wrap">${esc(detail)}</td>
+      <td>${canCancel
+        ? `<button class="danger mini" data-cancel="${esc(j.id)}">取消</button>`
+        : ''}</td></tr>`;
+  }
+  html += '</table>';
+  box.innerHTML = html;
 }
 
 function renderStats(s) {
@@ -195,6 +296,10 @@ document.addEventListener('click', async e => {
       document.getElementById('action-panel').style.display = 'block';
       document.getElementById('sel-label').textContent = `${label}（会话 ${sessionId}）`;
       refresh();
+    } else if (t.dataset.cancel) {
+      const job = await api(`/api/queue/${t.dataset.cancel}`, {method: 'DELETE'});
+      toast(`任务 ${job.id} 已取消（未执行）`, true);
+      refresh();
     } else if (t.dataset.delSession) {
       await api(`/api/sessions/${t.dataset.delSession}`, {method: 'DELETE'});
       selected = null;
@@ -212,6 +317,13 @@ document.addEventListener('click', async e => {
         {method: 'POST', body: JSON.stringify({branch_id: selected.branchId, tokens})});
       document.getElementById('append-tokens').value = '';
       toast(`追加成功，下一词元预测：${r.branch.prediction.argmax}`, true); refresh();
+    } else if (t.id === 'btn-enqueue') {
+      if (!selected) return;
+      const tokens = parseTokens(document.getElementById('append-tokens').value);
+      const r = await api(`/api/sessions/${selected.sessionId}/queue`,
+        {method: 'POST', body: JSON.stringify({branch_id: selected.branchId, tokens})});
+      document.getElementById('append-tokens').value = '';
+      toast(`任务 ${r.id} 已加入队列`, true); refresh();
     } else if (t.id === 'btn-fork') {
       if (!selected) return;
       const raw = document.getElementById('fork-pos').value;

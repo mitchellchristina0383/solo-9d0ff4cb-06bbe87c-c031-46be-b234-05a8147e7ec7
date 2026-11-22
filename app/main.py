@@ -1,11 +1,16 @@
 """FastAPI 应用：会话/分叉/追加/预测/关闭/占用统计的 HTTP 接口 + 单页网页。
 
-追加、分叉、关闭都是同步视图函数（FastAPI 在线程池中执行），
-引擎内部用一把锁串行化状态变更，保证并发追加的原子性。
+追加有两种入口：
+- `POST /api/sessions/{id}/append`：同步执行，容量不足直接 409（原有行为）；
+- `POST /api/sessions/{id}/queue` 与 `POST /api/queue`：追加任务队列，按会话
+  公平轮转、入队后可取消、容量不足等待回收后重试。
+
+队列只存在于进程内存，服务重启后未执行任务全部丢弃。
 """
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -14,6 +19,7 @@ from pydantic import BaseModel
 
 from .blocks import CapacityError
 from .engine import Engine, NotFoundError, ValidationError
+from .queue import AppendQueue, QueueClosedError, QueueFullError
 
 STATIC = Path(__file__).parent / "static" / "index.html"
 
@@ -33,6 +39,10 @@ class AppendReq(BaseModel):
     tokens: list[int]
 
 
+class EnqueueReq(AppendReq):
+    session_id: str
+
+
 def _engine_from_env() -> Engine:
     return Engine.from_config(
         vocab_size=int(os.getenv("VOCAB_SIZE", "64")),
@@ -43,10 +53,32 @@ def _engine_from_env() -> Engine:
     )
 
 
-def create_app(engine: Engine | None = None) -> FastAPI:
+def _queue_from_env(engine: Engine) -> AppendQueue:
+    return AppendQueue(engine,
+                       max_queued=int(os.getenv("MAX_QUEUED", "100")),
+                       max_history=int(os.getenv("MAX_HISTORY", "200")))
+
+
+def create_app(engine: Engine | None = None,
+               queue: AppendQueue | None = None) -> FastAPI:
     eng = engine or _engine_from_env()
-    app = FastAPI(title="KV-Cache 分叉对比")
+    q = queue or _queue_from_env(eng)
+    # 由本应用创建的队列随应用生命周期启停；外部注入的队列由调用方负责。
+    owns_queue = queue is None
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        if owns_queue:
+            q.start()
+        try:
+            yield
+        finally:
+            if owns_queue:
+                q.stop()
+
+    app = FastAPI(title="KV-Cache 分叉对比", lifespan=lifespan)
     app.state.engine = eng
+    app.state.queue = q
 
     @app.exception_handler(NotFoundError)
     async def _404(_: Request, exc: NotFoundError):
@@ -59,6 +91,14 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     @app.exception_handler(CapacityError)
     async def _409(_: Request, exc: CapacityError):
         return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(QueueFullError)
+    async def _429(_: Request, exc: QueueFullError):
+        return JSONResponse({"detail": str(exc)}, status_code=429)
+
+    @app.exception_handler(QueueClosedError)
+    async def _503(_: Request, exc: QueueClosedError):
+        return JSONResponse({"detail": str(exc)}, status_code=503)
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -99,6 +139,32 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     @app.get("/api/stats")
     def stats():
         return eng.stats()
+
+    # ---------- 追加任务队列 ----------
+
+    @app.post("/api/sessions/{session_id}/queue", status_code=202)
+    def enqueue(session_id: str, req: AppendReq):
+        return q.submit(session_id, req.branch_id, req.tokens)
+
+    @app.post("/api/queue", status_code=202)
+    def enqueue_any(req: EnqueueReq):
+        return q.submit(req.session_id, req.branch_id, req.tokens)
+
+    @app.get("/api/queue")
+    def list_jobs(session_id: str | None = None):
+        return q.list(session_id)
+
+    @app.get("/api/queue/status")
+    def queue_status():
+        return q.snapshot()
+
+    @app.get("/api/queue/{job_id}")
+    def get_job(job_id: str):
+        return q.get(job_id)
+
+    @app.delete("/api/queue/{job_id}")
+    def cancel_job(job_id: str):
+        return q.cancel(job_id)
 
     return app
 

@@ -56,3 +56,12 @@ class BlockPool:
 
     def snapshot(self) -> list[dict]:
         return [{"id": i, "refcount": r} for i, r in enumerate(self.refcount)]
+
+    # 事务回滚用的占用快照：只保存引用计数与空闲栈的顺序，不复制 K/V 数据。
+    def save_state(self) -> tuple[list[int], list[int]]:
+        return list(self.refcount), list(self._free)
+
+    def restore_state(self, state: tuple[list[int], list[int]]) -> None:
+        refcount, free = state
+        self.refcount[:] = refcount
+        self._free[:] = free
